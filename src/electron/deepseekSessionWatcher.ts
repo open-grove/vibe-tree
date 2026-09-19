@@ -21,6 +21,12 @@ const INITIAL_SCAN_DELAY_MS = 100;
 const STATE_VERSION = 1;
 const ZSTD_MAGIC = 0xfd2fb528;
 const DEFAULT_PROVIDER = "deepseek-harness";
+// Session format generations whose JSONL envelope this adapter understands.
+const SESSION_VERSION_LEGACY = 0;
+const SESSION_VERSION_CURRENT = 3;
+// `session.jsonl` (generation 0) and `session.v<N>.jsonl` (later generations),
+// each optionally Zstandard-compressed.
+const SESSION_FILE_PATTERN = /^session(?:\.v\d+)?\.jsonl(?:\.zstd)?$/;
 
 type JsonRecord = Record<string, unknown>;
 
@@ -53,6 +59,9 @@ interface FileState {
   fileIdentity?: string;
   sessionId?: string;
   headerIdentity?: string;
+  // Generation 3 sessions declare inheritance in the header and derive the cut
+  // from the last tagged `session/end-seed` marker instead of `seedLength`.
+  headerInherited?: boolean;
   seedLength: number;
   route: Route;
   openStep?: { turn: number; step: number };
@@ -73,6 +82,7 @@ interface SessionHeader {
   createdAt?: number;
   cwd?: string;
   seedLength: number;
+  inherited?: boolean;
 }
 
 interface ScannedFrame {
@@ -275,10 +285,20 @@ function processRecord(
     }
     fileState.sessionId = header.id;
     fileState.headerIdentity = identity;
+    fileState.headerInherited = header.inherited;
     fileState.seedLength = header.seedLength;
     return { imported: false };
   }
   if (!fileState.sessionId) return { imported: false };
+
+  if (type === "session/end-seed") {
+    // Generation 3: only a seeded session carries the tagged marker, whose
+    // sequence ends the inherited prefix. Unseeded logs keep no inherited cut.
+    if (fileState.headerInherited && asRecord(data)?.inherited === true && seq >= 0) {
+      fileState.seedLength = Math.floor(seq);
+    }
+    return { imported: false };
+  }
 
   if (type === "step/start") {
     const turn = numberValue(data.turn);
@@ -348,6 +368,10 @@ function processRecord(
       createdAt: recordTimestamp(record),
       route: { ...fileState.route },
     };
+    // A seeded generation 3 log derives its inherited cut from a marker that may
+    // only appear later in the file, so its usage is finalized at the step
+    // boundary instead of here. Every other envelope is finalized immediately.
+    if (fileState.headerInherited) return { imported: false };
     return { imported: finalizePending(fileState, state, options, turn, step) };
   }
   if (type === "turn/end") {
@@ -403,15 +427,26 @@ function newFileState(encoding: "raw" | "zstd"): FileState {
 
 function parseSessionHeader(record: JsonRecord): SessionHeader | undefined {
   if (record.type !== "session" || typeof record.id !== "string" || !record.id.trim()) return undefined;
-  const version = numberValue(record.version);
-  if (version !== 0) return undefined;
+  const version = numberValue(record.version) ?? 0;
+  // Harness generation 0 keeps the original envelope and generation 3 reuses it
+  // with versioned artifact names. Later unknown generations must stay ignored
+  // rather than be counted with assumptions that may no longer hold.
+  if (version !== SESSION_VERSION_LEGACY && version !== SESSION_VERSION_CURRENT) return undefined;
+  const inherited = inheritsHistory(record);
   return {
     id: record.id,
     version,
     createdAt: numberValue(record.createdAt),
     cwd: typeof record.cwd === "string" ? record.cwd : undefined,
-    seedLength: Math.max(0, Math.floor(numberValue(record.seedLength) ?? 0)),
+    // Only the legacy envelope declares its inherited prefix as a count.
+    seedLength: version === SESSION_VERSION_LEGACY ? Math.max(0, Math.floor(numberValue(record.seedLength) ?? 0)) : 0,
+    ...(inherited === undefined ? {} : { inherited }),
   };
+}
+
+function inheritsHistory(record: JsonRecord) {
+  const value = record.isSeeded ?? record.inherited;
+  return typeof value === "boolean" ? value : undefined;
 }
 
 function routeFrom(record: JsonRecord | undefined): Route | undefined {
@@ -493,7 +528,7 @@ function listSessionFiles(root: string): string[] {
     for (const entry of entries) {
       const path = join(dir, entry.name);
       if (entry.isDirectory()) walk(path);
-      else if (entry.isFile() && (entry.name === "session.jsonl" || entry.name === "session.jsonl.zstd")) result.push(path);
+      else if (entry.isFile() && SESSION_FILE_PATTERN.test(entry.name)) result.push(path);
     }
   };
   walk(root);

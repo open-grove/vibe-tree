@@ -73,8 +73,13 @@ mkdirSync(sessionsRoot, { recursive: true });
 mkdirSync(userDataPath, { recursive: true });
 const zstdPath = join(sessionsRoot, "--fixture--", "session.jsonl.zstd");
 const rawPath = join(sessionsRoot, "--fixture-raw--", "session.jsonl");
+// Generation 3 artifacts keep the generation in the filename.
+const v3Path = join(sessionsRoot, "--fixture-v3--", "session.v3.jsonl.zstd");
 mkdirSync(join(sessionsRoot, "--fixture--"), { recursive: true });
 mkdirSync(join(sessionsRoot, "--fixture-raw--"), { recursive: true });
+mkdirSync(join(sessionsRoot, "--fixture-v3--"), { recursive: true });
+mkdirSync(join(sessionsRoot, "--fixture-future--"), { recursive: true });
+mkdirSync(join(sessionsRoot, "--fixture-v3-seeded--"), { recursive: true });
 
 const events = [];
 const watcher = startDeepSeekSessionWatcher({
@@ -145,6 +150,63 @@ try {
   await watcher.scanNow();
   assert(events.length === 3 && events[2].totalTokens === 8, "failed request chunk should fall back at step/end");
 
+  const v3Time = now + 4000;
+  writeFileSync(v3Path, Buffer.concat([
+    frame([
+      { type: "session", version: 3, id: "fixture-v3", createdAt: v3Time, cwd: "/tmp/fixture", isSeeded: false, delegationDepth: 0 },
+      event("permission/preset", 0, v3Time, { preset: "standard" }),
+      event("session/end-seed", 1, v3Time, {}),
+      event("turn/start", 2, v3Time, { turn: 0 }),
+      event("step/start", 3, v3Time, { turn: 0, step: 0 }),
+      event("request/context", 4, v3Time, { provider: "deepseek-official", model: "deepseek-flash" }),
+    ]),
+    frame([
+      event("assistant/message", 5, v3Time, { turn: 0, step: 0, usage: usage(200, 90, 11, 0) }),
+      event("step/end", 6, v3Time, { turn: 0, step: 0 }),
+    ]),
+  ]));
+  await watcher.scanNow();
+  assert(events.length === 4, `generation 3 session should emit one finalized usage event, got ${events.length}`);
+  const v3Event = events[3];
+  assert(v3Event && v3Event.model === "deepseek-flash", "generation 3 model route must be retained");
+  assert(v3Event.totalTokens === 290 && v3Event.cacheReadTokens === 11, "generation 3 usage buckets must be preserved");
+  assert(v3Event.source === "deepseek-session" && v3Event.agent === "deepseek-harness", "generation 3 source mapping must stay unchanged");
+
+  appendFrame(v3Path, [
+    event("step/start", 7, v3Time + 1000, { turn: 0, step: 1 }),
+    event("request/context", 8, v3Time + 1000, { provider: "deepseek-official", model: "deepseek-flash" }),
+    event("assistant/message", 9, v3Time + 1000, { turn: 0, step: 1, usage: usage(300, 120) }),
+    event("step/end", 10, v3Time + 1000, { turn: 0, step: 1 }),
+  ]);
+  await watcher.scanNow();
+  assert(events.length === 5 && events[4].totalTokens === 420, "appended generation 3 frames must keep importing");
+
+  writeFileSync(join(sessionsRoot, "--fixture-future--", "session.v9.jsonl.zstd"), frame([
+    { type: "session", version: 9, id: "fixture-v9", createdAt: v3Time, isSeeded: false },
+    event("step/start", 0, v3Time, { turn: 0, step: 0 }),
+    event("assistant/message", 1, v3Time, { turn: 0, step: 0, usage: usage(50, 20) }),
+    event("step/end", 2, v3Time, { turn: 0, step: 0 }),
+  ]));
+  await watcher.scanNow();
+  assert(events.length === 5, "unknown later session generations must stay ignored");
+
+  // A seeded generation 3 session marks the end of its inherited prefix with a
+  // tagged `session/end-seed`; inherited usage must not be imported again.
+  writeFileSync(join(sessionsRoot, "--fixture-v3-seeded--", "session.v3.jsonl"), [
+    line({ type: "session", version: 3, id: "fixture-v3-seeded", createdAt: v3Time + 2000, isSeeded: true, parentSession: "fixture-parent" }),
+    line(event("step/start", 1, v3Time + 2000, { turn: 0, step: 0 })),
+    line(event("assistant/message", 2, v3Time + 2000, { turn: 0, step: 0, usage: usage(4000, 900) })),
+    line(event("session/end-seed", 3, v3Time + 2000, { inherited: true })),
+    line(event("step/end", 4, v3Time + 2000, { turn: 0, step: 0 })),
+    line(event("step/start", 5, v3Time + 3000, { turn: 1, step: 0 })),
+    line(event("request/context", 6, v3Time + 3000, { provider: "deepseek-official", model: "deepseek-flash" })),
+    line(event("assistant/message", 7, v3Time + 3000, { turn: 1, step: 0, usage: usage(600, 200) })),
+    line(event("step/end", 8, v3Time + 3000, { turn: 1, step: 0 })),
+  ].join(""), "utf8");
+  await watcher.scanNow();
+  assert(events.length === 6, `seeded generation 3 session should import only local usage, got ${events.length}`);
+  assert(events[5].totalTokens === 800, "usage after the inherited cut must still import");
+
   watcher.close();
   const restartEvents = [];
   const restarted = startDeepSeekSessionWatcher({
@@ -169,7 +231,7 @@ try {
   restarted.close();
 
   const persistedState = JSON.parse(readFileSync(join(userDataPath, "deepseek-session-watcher.json"), "utf8"));
-  assert(persistedState.version === 1 && Object.keys(persistedState.files).length === 2, "watcher state must persist both files");
+  assert(persistedState.version === 1 && Object.keys(persistedState.files).length === 5, "watcher state must persist every discovered artifact");
   console.log("deepseek session watcher fixture tests passed");
 } finally {
   watcher.close();

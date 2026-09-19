@@ -3,11 +3,17 @@
 ## Format and locations
 
 Vibe Tree reads the DeepSeek Harness session-persistence artifacts; it does not
-invoke the Harness runtime or upload prompts. The current Harness format is
-version `0`: the first JSONL record is a `session` header, followed by events in
-`{ type, seq, time, data }` envelopes. The configured persistence backend emits
-either plain `session.jsonl` or concatenated independent Zstandard frames in
-`session.jsonl.zstd`.
+invoke the Harness runtime or upload prompts. The adapter accepts the released
+session format generations `0` and `3`. Both start with a `session` header
+followed by events in `{ type, seq, time, data }` envelopes. Generation `0`
+writes plain `session.jsonl` or concatenated independent Zstandard frames in
+`session.jsonl.zstd`; generation `3` (Harness `0.1.5-rc` and later) writes the
+versioned `session.v3.jsonl`/`session.v3.jsonl.zstd`. Generation `3` adds header
+fields such as `isSeeded`, `origin`, `parentSession`, and `delegationDepth`, and
+emits `session/end-seed` and `model/selection` events, while the step lifecycle,
+request route, and per-step usage envelopes this adapter reads are unchanged.
+Later unknown generations are ignored rather than counted with assumptions that
+may no longer hold.
 
 The format references used by this adapter are the upstream
 [session types](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/core/session/src/types.ts),
@@ -32,8 +38,11 @@ platforms.
   state persistence in `deepseek-session-watcher.json`.
 - Usage samples are folded by `(session, turn, step)`. A later
   `assistant/message` sample replaces an earlier usage chunk; if a request fails,
-  the latest usage chunk is finalized at `step/end`. `seedLength` excludes
-  inherited seed events.
+  the latest usage chunk is finalized at `step/end`. Inherited seed events are
+  excluded: generation 0 reads the `seedLength` header field, while a seeded
+  generation 3 session counts only usage after the last
+  `session/end-seed` marker tagged `data.inherited` and therefore finalizes at
+  the step boundary.
 - The ledger event is `source: deepseek-session`, `agent: deepseek-harness`.
   `totalTokens` is uncached input plus output; cache read/write buckets remain
   separate and are counted by Vibe Tree's normal token accounting.
