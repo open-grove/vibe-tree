@@ -22,7 +22,9 @@
     "verify:renderer-ledger": "npm run build && node scripts/verify-renderer-ledger.mjs",
     "verify:worker-api": "node server/leaderboard-worker/scripts/verify-worker-api.mjs",
     "typecheck": "tsc -p tsconfig.electron.json --noEmit && tsc -p tsconfig.json --noEmit",
-    "start": "node scripts/start.mjs"
+    "start": "node scripts/start.mjs",
+    "test:usage-accounting": "npm run build && node scripts/test-usage-accounting.mjs",
+    "repair:usage-accounting": "node scripts/repair-usage-accounting.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

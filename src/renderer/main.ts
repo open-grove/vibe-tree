@@ -1,3 +1,4 @@
+import { upsertUsageEntries } from "../shared/localUsageLedger.js";
 import type {
   AchievementState,
   AchievementUnlock,
@@ -1036,7 +1037,7 @@ async function boot() {
   });
   window.bonsai.onLedgerAppend((entries) => {
     if (!ledger || !entries.length) return;
-    ledger = { ...ledger, entries: entries.concat(ledger.entries) };
+    ledger = { ...ledger, entries: upsertUsageEntries(ledger.entries, entries) };
     render();
   });
   window.bonsai.onLedgerPatch(({ upserted, deletedIds }) => {

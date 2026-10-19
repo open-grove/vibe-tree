@@ -1,3 +1,4 @@
+import { entryForLocalUsage, upsertUsageEntries } from "../shared/localUsageLedger.js";
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, net, Notification, screen, session, shell, Tray } from "electron";
 import {
   appendFileSync,
@@ -193,7 +194,8 @@ let ledger: LedgerFile = { entries: [], settings: DEFAULT_SETTINGS, installedAt:
 let trayStatsBaseCache:
   | { todayKey: string; enabledKey: string; totalXp: number; todayXp: number; entriesBySource: Map<string, number> }
   | undefined;
-let ledgerEntryIds = new Set<string>();
+let ledgerEntriesById = new Map<string, LedgerEntry>();
+let pendingUsageHasReplacements = false;
 let cloudUsageSnapshotCache:
   | { entries: LedgerEntry[]; length: number; firstId?: string; firstTokens?: number; deviceId: string; snapshot: CloudUsageSnapshot }
   | undefined;
@@ -472,7 +474,7 @@ function setTreeStartMode(mode: "new" | "cloud") {
     mode === "cloud" ? entryBelongsToCurrentTree(entry, installedAt) : entryTime(entry) >= Date.parse(installedAt),
   );
   trayStatsBaseCache = undefined;
-  resetLedgerEntryIds();
+  resetLedgerEntriesById();
   updateSettings({ treeStartMode: mode });
   broadcastLedgerNow();
 }
@@ -2164,8 +2166,8 @@ function cleanCloudModelLabel(value: unknown) {
   return typeof value === "string" && value.trim() ? value.trim().slice(0, 64) : undefined;
 }
 
-function resetLedgerEntryIds() {
-  ledgerEntryIds = new Set(ledger.entries.map((entry) => entry.id));
+function resetLedgerEntriesById() {
+  ledgerEntriesById = new Map(ledger.entries.map((entry) => [entry.id, entry]));
 }
 
 function schedulePendingUsageFlush() {
@@ -2180,34 +2182,25 @@ function flushPendingUsageEntries() {
   }
   if (!pendingUsageEntries.length) return;
 
-  const entries = pendingUsageEntries;
+  const entries = [...new Map(pendingUsageEntries.map((entry) => [entry.id, entry])).values()];
   pendingUsageEntries = [];
-  appendTrayStats(entries);
-  ledger.entries = entries.reverse().concat(ledger.entries);
-  scheduleLedgerBroadcast(entries);
+  const hadReplacements = pendingUsageHasReplacements;
+  pendingUsageHasReplacements = false;
+  if (hadReplacements) trayStatsBaseCache = undefined;
+  else appendTrayStats(entries);
+  ledger.entries = upsertUsageEntries(ledger.entries, entries);
+  cloudUsageSnapshotCache = undefined;
+  if (hadReplacements) broadcastLedgerNow();
+  else scheduleLedgerBroadcast(entries);
   leaderboardService.scheduleCloudSyncSoon();
 }
 
 function appendUsageEvent(event: UsageEvent) {
-  if (ledgerEntryIds.has(event.id)) return;
-
-  const entry: LedgerEntry = {
-    id: event.id,
-    createdAt: event.createdAt,
-    source: event.source,
-    tokens: event.totalTokens,
-    note: `${event.agent}${event.model ? ` · ${event.model}` : ""}`,
-    agent: event.agent,
-    provider: event.provider,
-    model: event.model,
-    inputTokens: event.inputTokens,
-    outputTokens: event.outputTokens,
-    cacheReadTokens: event.cacheReadTokens,
-    cacheWriteTokens: event.cacheWriteTokens,
-    deviceId: ensureCloudSyncDeviceId(),
-  };
-  entry.tokens = countedTokensForEntry(entry);
-  ledgerEntryIds.add(entry.id);
+  const existing = ledgerEntriesById.get(event.id);
+  const entry = entryForLocalUsage(event, ensureCloudSyncDeviceId(), existing);
+  if (entry === existing) return;
+  pendingUsageHasReplacements ||= Boolean(existing);
+  ledgerEntriesById.set(entry.id, entry);
   pendingUsageEntries.push(entry);
   appendUsageEntryToStore(entry);
   schedulePendingUsageFlush();
@@ -2277,7 +2270,7 @@ function appendRemoteEntries(entries: LedgerEntry[], deletedEntryIds: string[] =
     const deduped = dedupeCloudMirroredEntries(ledger.entries);
     if (!deduped.removedCount && !removedBeforeMerge) return 0;
     ledger.entries = deduped.entries;
-    resetLedgerEntryIds();
+    resetLedgerEntriesById();
     rewriteUsageEntriesStore(ledger.entries);
     broadcastLedgerNow();
     return removedBeforeMerge + deduped.removedCount;
@@ -2288,6 +2281,7 @@ function appendRemoteEntries(entries: LedgerEntry[], deletedEntryIds: string[] =
     if (index >= 0) {
       ledger.entries = ledger.entries.slice();
       ledger.entries[index] = replacement;
+      ledgerEntriesById.set(replacement.id, replacement);
       broadcastLedgerPatch([replacement]);
       return 1;
     }
@@ -2296,7 +2290,7 @@ function appendRemoteEntries(entries: LedgerEntry[], deletedEntryIds: string[] =
   const kept = ledger.entries.filter((entry) => !repairedIds.has(entry.id));
   const deduped = dedupeCloudMirroredEntries([...accepted, ...repaired, ...kept]);
   ledger.entries = deduped.entries;
-  resetLedgerEntryIds();
+  resetLedgerEntriesById();
   if (repaired.length || removedBeforeMerge || deduped.removedCount) rewriteUsageEntriesStore(ledger.entries);
   broadcastLedgerNow();
   return accepted.length + repaired.length + removedBeforeMerge + deduped.removedCount;
@@ -2562,6 +2556,7 @@ function rendererViewForSender(sender: Electron.WebContents): RendererLedgerView
 }
 
 function broadcastLedgerNow() {
+  pendingLedgerBroadcastEntries = [];
   if (ledgerBroadcastTimer) {
     clearTimeout(ledgerBroadcastTimer);
     ledgerBroadcastTimer = null;
@@ -2575,6 +2570,11 @@ function broadcastLedgerNow() {
 }
 
 function broadcastLedgerPatch(upserted: LedgerEntry[], deletedIds: string[] = []) {
+  // A compact snapshot already includes queued appends; do not send them twice.
+  if (pendingLedgerBroadcastEntries.length) {
+    broadcastLedgerNow();
+    return;
+  }
   if (managerWindow && !managerWindow.isDestroyed()) {
     managerWindow.webContents.send("bonsai:ledger-patch", { upserted, deletedIds });
   }
@@ -3519,7 +3519,7 @@ app.whenReady().then(async () => {
   }
   Menu.setApplicationMenu(null);
   ledger = readLedger();
-  resetLedgerEntryIds();
+  resetLedgerEntriesById();
   updateStatus = {
     ...updateStatus,
     currentVersion: currentAppVersion(),
@@ -3741,7 +3741,7 @@ ipcMain.handle("ledger:add-entry", (event, input: { tokens: number; note?: strin
   };
   appendTrayStats([entry]);
   ledger.entries.unshift(entry);
-  ledgerEntryIds.add(entry.id);
+  ledgerEntriesById.set(entry.id, entry);
   appendUsageEntryToStore(entry);
   broadcastLedgerNow();
   return ledgerForRenderer(ledger, rendererViewForSender(event.sender));

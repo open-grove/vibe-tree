@@ -27,6 +27,7 @@ interface SessionWatcherOptions {
 }
 
 interface WatchState {
+  version?: number;
   files: Record<string, number>;
   events: Record<string, boolean>;
   sessions: Record<string, UsageSnapshot>;
@@ -356,7 +357,8 @@ function startAgentSessionWatcher(options: SessionWatcherOptions, config: AgentC
   const importHistory = process.env[config.importHistoryEnv] === "today" || Boolean(historyStartAtMs);
   const statePath = join(options.userDataPath, config.stateFileName);
   const state = readState(statePath);
-  if (state.historyStartAt !== options.historyStartAt) {
+  if (state.version !== 1 || state.historyStartAt !== options.historyStartAt) {
+    state.version = 1;
     state.files = {};
     state.events = {};
     state.historyStartAt = options.historyStartAt;
@@ -407,7 +409,7 @@ function startAgentSessionWatcher(options: SessionWatcherOptions, config: AgentC
     options.onStatus?.(status);
     for (let index = 0; index < files.length; index += 1) {
       if (closed) return;
-      const imported = scanFile(
+      const imported = scanAgentSessionFile(
         files[index],
         state,
         config,
@@ -537,7 +539,7 @@ function startJsonAgentSessionWatcher(options: SessionWatcherOptions, config: Js
   };
 }
 
-function scanFile(
+export function scanAgentSessionFile(
   filePath: string,
   state: WatchState,
   config: AgentConfig,
@@ -554,7 +556,7 @@ function scanFile(
     return imported;
   }
 
-  imported += scanNewLines(filePath, offset, stats.size, (line, lineOffset) => {
+  const scanned = scanNewLines(filePath, offset, stats.size, (line, lineOffset) => {
     const event = config.parseLine(line, filePath, lineOffset);
     if (!event || !usageEventHasTokens(event)) return 0;
     if (isBeforeHistoryStart(event.createdAt, settings.historyStartAtMs)) return 0;
@@ -562,8 +564,8 @@ function scanFile(
     return 1;
   });
 
-  state.files[filePath] = stats.size;
-  return imported;
+  state.files[filePath] = scanned.committedOffset;
+  return imported + scanned.imported;
 }
 
 function scanJsonFile(
@@ -609,9 +611,9 @@ function scanHermesStateDb(
   settings: { importHistory: boolean; watcherStartedAt: number; historyStartAtMs?: number },
   onUsage: (event: UsageEvent) => void,
 ) {
-  const stats = statSync(stateDbPath);
+  const currentMtime = sqliteDbScanMtime(stateDbPath);
   const previousMtime = state.files[stateDbPath];
-  if (previousMtime !== undefined && stats.mtimeMs <= previousMtime) {
+  if (state.version === 1 && previousMtime !== undefined && currentMtime <= previousMtime) {
     return 0;
   }
 
@@ -619,7 +621,7 @@ function scanHermesStateDb(
   if (!rows) {
     return 0;
   }
-  state.files[stateDbPath] = stats.mtimeMs;
+  state.files[stateDbPath] = currentMtime;
 
   let imported = 0;
   for (const row of rows) {
@@ -634,7 +636,7 @@ function scanHermesStateDb(
 
     const createdAt = timestampToIso(row.ended_at) || timestampToIso(row.started_at) || new Date().toISOString();
     const isHistorical = isBeforeHistoryStart(createdAt, settings.historyStartAtMs);
-    const previous = state.sessions[sessionId];
+    const previous = hermesPreviousSnapshot(snapshot, state.sessions[sessionId], state.version);
     state.sessions[sessionId] = maxSnapshot(snapshot, previous);
 
     if (isHistorical) continue;
@@ -665,6 +667,7 @@ function scanHermesStateDb(
     imported += 1;
   }
 
+  state.version = 1;
   writeState(statePath, state);
   return imported;
 }
@@ -823,28 +826,24 @@ function scanNewLines(filePath: string, start: number, end: number, onLine: (lin
       }
     }
 
-    pending += decoder.end();
-    if (pending.trim()) {
-      imported += onLine(pending, pendingOffset);
-    }
+    // Commit complete records only; the next scan retries any partial UTF-8/JSON line.
   } finally {
     closeSync(fd);
   }
 
-  return imported;
+  return { imported, committedOffset: pendingOffset };
 }
 
 function delay(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-function parseClaudeLine(line: string, filePath: string, lineOffset: number): UsageEvent | undefined {
+export function parseClaudeLine(line: string, filePath: string, lineOffset: number): UsageEvent | undefined {
   const parsed = parseJson(line);
   if (!parsed || parsed.type !== "assistant") return undefined;
 
   const message = asRecord(parsed.message);
   if (!message) return undefined;
-  if (!message.stop_reason) return undefined;
 
   const usage = asRecord(message.usage);
   const tokens = parseStandardUsage(usage);
@@ -1137,10 +1136,17 @@ function readHermesSessionRows(stateDbPath: string): HermesSessionRow[] | undefi
 function hermesUsageSnapshot(row: HermesSessionRow): UsageSnapshot {
   return {
     inputTokens: numberValue(row.input_tokens),
-    outputTokens: numberValue(row.output_tokens) + numberValue(row.reasoning_tokens),
+    outputTokens: numberValue(row.output_tokens),
     cacheReadTokens: numberValue(row.cache_read_tokens),
     cacheWriteTokens: numberValue(row.cache_write_tokens),
   };
+}
+
+function hermesPreviousSnapshot(snapshot: UsageSnapshot, previous: UsageSnapshot | undefined, version?: number) {
+  if (!previous || version === 1 || previous.outputTokens === 0) return previous;
+  // Older checkpoints mixed output with reasoning, but did not retain reasoning separately.
+  // Rebase the unknown output component once so it cannot suppress future output deltas.
+  return { ...previous, outputTokens: snapshot.outputTokens };
 }
 
 function initialHermesSnapshotDelta(
@@ -1275,6 +1281,7 @@ function readState(path: string): WatchState {
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<WatchState>;
     return {
+      version: parsed.version,
       files: parsed.files && typeof parsed.files === "object" ? parsed.files : {},
       events: parsed.events && typeof parsed.events === "object" ? parsed.events : {},
       sessions: parsed.sessions && typeof parsed.sessions === "object" ? parsed.sessions : {},
@@ -1428,3 +1435,5 @@ function defaultPiSessionsRoot() {
   if (piCodingAgentDir) return join(piCodingAgentDir, "sessions");
   return join(homedir(), ".pi", "agent", "sessions");
 }
+
+export const __test = { hermesUsageSnapshot, hermesPreviousSnapshot };

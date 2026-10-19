@@ -59,7 +59,7 @@ const POLL_INTERVAL_MS = 10_000;
 const READ_CHUNK_SIZE = 64 * 1024;
 const SCAN_YIELD_INTERVAL_MS = 25;
 const DEFAULT_SESSIONS_ROOT = join(homedir(), ".codex", "sessions");
-const WATCH_STATE_VERSION = 7;
+const WATCH_STATE_VERSION = 8;
 const SESSION_META_READ_LIMIT = 2 * 1024 * 1024;
 const PARENT_CUMULATIVE_TAIL_READ_LIMIT = 16 * 1024 * 1024;
 const PARENT_CUMULATIVE_TAIL_CHUNK_SIZE = 256 * 1024;
@@ -74,7 +74,10 @@ export function startCodexSessionWatcher(options: CodexSessionWatcherOptions) {
   const statePath = join(options.userDataPath, "codex-session-watcher.json");
   const state = readState(statePath);
   if (state.version !== WATCH_STATE_VERSION || state.historyStartAt !== options.historyStartAt) {
-    state.files = {};
+    // Retain historical paths so offline archive repair can recover original event IDs.
+    state.files = state.historyStartAt === options.historyStartAt
+      ? Object.fromEntries(Object.keys(state.files).map((path) => [path, 0]))
+      : {};
     state.cumulativeTokens = {};
     state.acceptedCumulativeKeys = {};
     state.currentModels = {};
@@ -127,7 +130,7 @@ export function startCodexSessionWatcher(options: CodexSessionWatcherOptions) {
     let nextYieldAt = Date.now() + SCAN_YIELD_INTERVAL_MS;
     for (let index = 0; index < files.length; index += 1) {
       if (closed) return;
-      const imported = await scanFile(files[index], state, statePath, options, {
+      const imported = await scanCodexSessionFile(files[index], state, statePath, options, {
         importHistory,
         watcherStartedAt,
         historyStartAtMs,
@@ -169,7 +172,7 @@ export function startCodexSessionWatcher(options: CodexSessionWatcherOptions) {
   };
 }
 
-async function scanFile(
+export async function scanCodexSessionFile(
   filePath: string,
   state: WatchState,
   _statePath: string,
@@ -179,6 +182,9 @@ async function scanFile(
     watcherStartedAt: number;
     historyStartAtMs?: number;
     sessionsRoot: string;
+    /** Offline replay can retain the pre-archive path used in stable event IDs. */
+    identityPath?: string;
+    includeArchived?: boolean;
     shouldYield?: () => boolean;
     onYield?: () => Promise<void>;
   },
@@ -186,11 +192,13 @@ async function scanFile(
   let imported = 0;
   const stats = statSync(filePath);
   const previousOffset = state.files[filePath];
-  if ((previousOffset === undefined || stats.size > previousOffset) && isArchivedCodexSession(filePath)) {
+  if ((previousOffset === undefined || stats.size > previousOffset) && !settings.includeArchived && isArchivedCodexSession(filePath)) {
     state.files[filePath] = stats.size;
     return imported;
   }
-  const forkBaseline = seedForkCumulativeBaseline(filePath, state, settings.sessionsRoot);
+  const meta = readCodexSessionMeta(filePath);
+  const independentUsage = !meta?.forkedFromId || meta.historyMode === "paginated";
+  const forkBaseline = seedForkCumulativeBaseline(filePath, state, settings.sessionsRoot, settings.identityPath);
   const offset =
     previousOffset ??
     initialOffset(filePath, stats, {
@@ -206,7 +214,7 @@ async function scanFile(
   }
 
   let currentModel = state.currentModels[filePath];
-  imported += await scanNewLines(
+  const scanned = await scanNewLines(
     filePath,
     offset,
     stats.size,
@@ -215,7 +223,7 @@ async function scanFile(
       if (turnContext) {
         currentModel = turnContext.model ?? currentModel;
       }
-      const event = parseCodexTokenCountLine(line, filePath, lineOffset, currentModel);
+      const event = parseCodexTokenCountLine(line, settings.identityPath ?? filePath, lineOffset, currentModel);
       if (event) {
         if (isBeforeHistoryStart(event.createdAt, settings.historyStartAtMs)) {
           const baselineUsage = event.cumulativeUsage ?? event.deltaUsage;
@@ -230,7 +238,7 @@ async function scanFile(
         const legacyPreviousTotal = undefined;
         const previousTotal = exactPreviousTotal ?? legacyPreviousTotal;
         const hasAcceptedKey = Boolean(state.acceptedCumulativeKeys[event.cumulativeKey]);
-        if (!hasAcceptedKey) {
+        if (!hasAcceptedKey && !independentUsage) {
           const baselineUsage = event.cumulativeUsage ?? event.deltaUsage;
           if (baselineUsage) {
             state.cumulativeTokens[event.cumulativeKey] = baselineUsage;
@@ -238,6 +246,7 @@ async function scanFile(
           state.acceptedCumulativeKeys[event.cumulativeKey] = true;
           return 0;
         }
+        state.acceptedCumulativeKeys[event.cumulativeKey] = true;
         const deltaUsage = previousTotal
           ? getDeltaUsage(event, exactPreviousTotal, legacyPreviousTotal)
           : event.deltaUsage ?? event.cumulativeUsage;
@@ -253,7 +262,7 @@ async function scanFile(
           ...event,
           inputTokens: deltaUsage.inputTokens,
           outputTokens: deltaUsage.outputTokens,
-          cacheReadTokens: deltaUsage.cacheReadTokens,
+          cacheReadTokens: Math.min(deltaUsage.inputTokens, deltaUsage.cacheReadTokens),
           totalTokens,
         });
         return 1;
@@ -263,7 +272,8 @@ async function scanFile(
     settings,
   );
 
-  state.files[filePath] = stats.size;
+  imported += scanned.imported;
+  state.files[filePath] = scanned.committedOffset;
   if (currentModel) state.currentModels[filePath] = currentModel;
   return imported;
 }
@@ -307,15 +317,13 @@ async function scanNewLines(
       }
     }
 
-    pending += decoder.end();
-    if (pending.trim()) {
-      imported += onLine(pending, pendingOffset);
-    }
+    // A writer can stop anywhere, including inside a UTF-8 character.
+    // Keep the byte offset before the unfinished record for the next poll.
   } finally {
     closeSync(fd);
   }
 
-  return imported;
+  return { imported, committedOffset: pendingOffset };
 }
 
 function delay(ms: number) {
@@ -366,7 +374,8 @@ function isArchivedCodexSession(filePath: string) {
 }
 
 function isForkedCodexSession(filePath: string) {
-  return Boolean(readCodexSessionMeta(filePath)?.forkedFromId);
+  const meta = readCodexSessionMeta(filePath);
+  return Boolean(meta?.forkedFromId && meta.historyMode !== "paginated");
 }
 
 function readCodexSessionMeta(filePath: string) {
@@ -378,13 +387,14 @@ function readCodexSessionMeta(filePath: string) {
   return {
     createdAtMs: typeof parsed.timestamp === "string" ? timestampMs(parsed.timestamp) : undefined,
     forkedFromId: typeof payload?.forked_from_id === "string" ? payload.forked_from_id : undefined,
+    historyMode: payload?.history_mode,
   };
 }
 
-function seedForkCumulativeBaseline(filePath: string, state: WatchState, sessionsRoot: string | undefined) {
+function seedForkCumulativeBaseline(filePath: string, state: WatchState, sessionsRoot: string | undefined, identityPath = filePath) {
   const meta = readCodexSessionMeta(filePath);
-  if (!meta?.forkedFromId || !sessionsRoot) return undefined;
-  const cumulativeKey = `${filePath}:total`;
+  if (!meta?.forkedFromId || meta.historyMode === "paginated" || !sessionsRoot) return undefined;
+  const cumulativeKey = `${identityPath}:total`;
   const existingUsage = normalizeStoredUsage(state.cumulativeTokens[cumulativeKey]);
   if (state.acceptedCumulativeKeys[cumulativeKey] && existingUsage) {
     return existingUsage;
@@ -732,7 +742,7 @@ function hash(value: string) {
 }
 
 export const __test = {
-  scanFile,
+  scanFile: scanCodexSessionFile,
   readState,
   writeState,
 };
