@@ -32,6 +32,13 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Usage accounting and Codex fork regression fixtures
+        run: |
+          node scripts/test-usage-accounting.mjs
+          node scripts/test-usage-repair.mjs
+          node scripts/test-codex-session-watcher.mjs
+          node scripts/verify-renderer-ledger.mjs
+
       - name: DeepSeek Harness watcher fixture
         run: node scripts/test-deepseek-session-watcher.mjs
 

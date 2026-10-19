@@ -56,6 +56,7 @@ export function ledgerForRenderer(ledger: LedgerFile, view: RendererLedgerView, 
       cacheReadTokens: breakdown.cacheReadTokens,
       cacheWriteTokens: breakdown.cacheWriteTokens,
       eventCount: representedEvents,
+      tokenAccounting: "normalized",
     });
   }
 

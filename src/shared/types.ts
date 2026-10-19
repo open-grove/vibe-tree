@@ -16,6 +16,8 @@ export interface LedgerEntry {
   eventFingerprint?: string;
   /** Number of local usage events represented by an aggregate cloud entry. */
   eventCount?: number;
+  /** IPC summaries have authoritative totals and cache-exclusive input. Never persisted. */
+  tokenAccounting?: "normalized";
 }
 
 export type AppLanguage = "zh-CN" | "en-US";

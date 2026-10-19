@@ -9,12 +9,12 @@ export interface CountedTokenBreakdown {
 }
 
 export function countedTokensForEntry(entry: LedgerEntry) {
-  if (entry.source === "cloud-sync" || entry.syncedFromCloud) return safeTokens(entry.tokens);
+  if (entry.tokenAccounting === "normalized" || entry.source === "cloud-sync" || entry.syncedFromCloud) return safeTokens(entry.tokens);
   if (!hasTokenBreakdown(entry)) return safeTokens(entry.tokens);
 
   const inputTokens = countedInputTokensForEntry(entry);
   const outputTokens = safeTokens(entry.outputTokens ?? 0);
-  const cacheReadTokens = safeTokens(entry.cacheReadTokens ?? 0);
+  const cacheReadTokens = countedCacheReadTokensForEntry(entry);
   const cacheWriteTokens = safeTokens(entry.cacheWriteTokens ?? 0);
   return inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
 }
@@ -23,7 +23,7 @@ export function countedTokenBreakdownForEntry(entry: LedgerEntry): CountedTokenB
   const tokens = countedTokensForEntry(entry);
   const inputTokens = countedInputTokensForEntry(entry);
   const outputTokens = safeTokens(entry.outputTokens ?? 0);
-  const cacheReadTokens = safeTokens(entry.cacheReadTokens ?? 0);
+  const cacheReadTokens = countedCacheReadTokensForEntry(entry);
   const cacheWriteTokens = safeTokens(entry.cacheWriteTokens ?? 0);
   const breakdown = { tokens, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens };
   const breakdownTotal = inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
@@ -33,8 +33,13 @@ export function countedTokenBreakdownForEntry(entry: LedgerEntry): CountedTokenB
 
 export function countedInputTokensForEntry(entry: LedgerEntry) {
   const inputTokens = safeTokens(entry.inputTokens ?? 0);
-  const cacheReadTokens = safeTokens(entry.cacheReadTokens ?? 0);
+  const cacheReadTokens = countedCacheReadTokensForEntry(entry);
   return inputTokensIncludeCacheRead(entry) ? Math.max(0, inputTokens - cacheReadTokens) : inputTokens;
+}
+
+function countedCacheReadTokensForEntry(entry: LedgerEntry) {
+  const cached = safeTokens(entry.cacheReadTokens ?? 0);
+  return inputTokensIncludeCacheRead(entry) ? Math.min(safeTokens(entry.inputTokens ?? 0), cached) : cached;
 }
 
 function hasTokenBreakdown(entry: LedgerEntry) {
@@ -47,6 +52,7 @@ function hasTokenBreakdown(entry: LedgerEntry) {
 }
 
 function inputTokensIncludeCacheRead(entry: LedgerEntry) {
+  if (entry.tokenAccounting === "normalized") return false;
   return (
     entry.source === "codex-session" ||
     entry.agent === "codex-desktop" ||
